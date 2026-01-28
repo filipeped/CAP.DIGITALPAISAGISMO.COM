@@ -515,7 +515,13 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         externalId = hashSHA256(baseId);
         console.log("⚠️ External_id gerado no servidor (fallback - IDÊNTICO ao DeduplicationEngine):", externalId);
       } else {
-        console.log("✅ External_id recebido do frontend (SHA256 - DeduplicationEngine):", externalId);
+        // ✅ Hashear external_id se não estiver hasheado (protege PII do n8n/bots)
+        if (externalId.length !== 64 || !/^[a-f0-9]{64}$/i.test(externalId)) {
+          externalId = hashSHA256(externalId);
+          console.log("🔐 External_id hasheado pelo CAPI (PII protegida):", externalId);
+        } else {
+          console.log("✅ External_id recebido já hasheado (SHA256):", externalId);
+        }
       }
 
       const eventName = event.event_name || "Lead";
