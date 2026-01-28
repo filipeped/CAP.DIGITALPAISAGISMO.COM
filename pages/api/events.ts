@@ -1,13 +1,14 @@
-// ✅ DIGITAL PAISAGISMO CAPI V9.0 - VERSÃO LIMPA (SEM HOTMART)
-// V9.0: Removido código Hotmart (não utilizado)
+// ✅ DIGITAL PAISAGISMO CAPI V9.1 - REDIS CACHE
+// V9.1: Cache Redis para deduplicação distribuída
+// - Upstash Redis para cache persistente entre instâncias
+// - Fallback para Map() se Redis não configurado
 // - Suporte a PII (email, telefone, nome) para integração com n8n
-// - Processamento automático com hash SHA256
-// - Deduplicação 6h, cache 50k eventos
-// - IPv6 inteligente
+// - Deduplicação 6h, IPv6 inteligente
 // - Tokens via variáveis de ambiente
 
 import * as crypto from "crypto";
 import * as zlib from "zlib";
+import { Redis } from "@upstash/redis";
 
 // Tipos para requisição e resposta (compatível com Express/Node.js)
 interface UserData {
@@ -67,53 +68,76 @@ if (!PIXEL_ID || !ACCESS_TOKEN) {
   console.error("❌ ERRO CRÍTICO: META_PIXEL_ID e META_ACCESS_TOKEN devem estar configurados nas variáveis de ambiente!");
 }
 
-// ✅ SISTEMA DE DEDUPLICAÇÃO MELHORADO
-const eventCache = new Map<string, number>();
-const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 horas (otimizado para reduzir eventos fantasma)
-const MAX_CACHE_SIZE = 50000; // Aumentado para suportar mais eventos
+// ✅ SISTEMA DE DEDUPLICAÇÃO COM REDIS (V9.1)
+const CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 horas em segundos
+const REDIS_KEY_PREFIX = "capi:event:";
 
-function isDuplicateEvent(eventId: string): boolean {
-  const now = Date.now();
+// Inicializar Redis (se configurado)
+let redis: Redis | null = null;
+const useRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
 
-  // Limpeza automática de eventos expirados (sem for...of)
-  let cleanedCount = 0;
-  eventCache.forEach((timestamp, id) => {
-    if (now - timestamp > CACHE_TTL) {
-      eventCache.delete(id);
-      cleanedCount++;
-    }
+if (useRedis) {
+  redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL!,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
   });
+  console.log("✅ Redis Upstash conectado para deduplicação distribuída");
+} else {
+  console.warn("⚠️ Redis não configurado - usando cache em memória (fallback)");
+}
 
-  if (cleanedCount > 0) {
-    console.log(`🧹 Cache limpo: ${cleanedCount} eventos expirados removidos (TTL: 6h)`);
+// Fallback: cache em memória (usado se Redis não estiver configurado)
+const memoryCache = new Map<string, number>();
+const MAX_MEMORY_CACHE = 50000;
+
+async function isDuplicateEvent(eventId: string): Promise<boolean> {
+  const cacheKey = `${REDIS_KEY_PREFIX}${eventId}`;
+
+  // ✅ REDIS: Cache distribuído persistente
+  if (redis) {
+    try {
+      // Verificar se existe no Redis
+      const exists = await redis.exists(cacheKey);
+
+      if (exists) {
+        console.warn(`🚫 [REDIS] Evento duplicado bloqueado: ${eventId}`);
+        return true;
+      }
+
+      // Adicionar ao Redis com TTL automático
+      await redis.set(cacheKey, Date.now(), { ex: CACHE_TTL_SECONDS });
+      console.log(`✅ [REDIS] Evento registrado: ${eventId} (TTL: 6h)`);
+      return false;
+
+    } catch (error) {
+      console.error("❌ Erro Redis, usando fallback em memória:", error);
+      // Fallback para memória em caso de erro
+    }
   }
 
-  // Verificar se é duplicata
-  if (eventCache.has(eventId)) {
-    const lastSeen = eventCache.get(eventId);
-    const timeDiff = now - (lastSeen || 0);
-    console.warn(`🚫 Evento duplicado bloqueado: ${eventId} (última ocorrência: ${Math.round(timeDiff/1000)}s atrás)`);
+  // ✅ FALLBACK: Cache em memória
+  const now = Date.now();
+  const ttlMs = CACHE_TTL_SECONDS * 1000;
+
+  // Limpeza de expirados
+  memoryCache.forEach((timestamp, id) => {
+    if (now - timestamp > ttlMs) memoryCache.delete(id);
+  });
+
+  // Verificar duplicata
+  if (memoryCache.has(eventId)) {
+    console.warn(`🚫 [MEMORY] Evento duplicado bloqueado: ${eventId}`);
     return true;
   }
 
-  // Controle de tamanho do cache
-  if (eventCache.size >= MAX_CACHE_SIZE) {
-    // Remove 10% do cache quando atingir o limite para melhor performance
-    const itemsToRemove = Math.floor(MAX_CACHE_SIZE * 0.1);
-    let removedCount = 0;
-    
-    const eventIds = Array.from(eventCache.keys());
-    for (let i = 0; i < itemsToRemove && i < eventIds.length; i++) {
-      eventCache.delete(eventIds[i]);
-      removedCount++;
-    }
-    
-    console.log(`🗑️ Cache overflow: ${removedCount} eventos mais antigos removidos (${eventCache.size}/${MAX_CACHE_SIZE})`);
+  // Controle de tamanho
+  if (memoryCache.size >= MAX_MEMORY_CACHE) {
+    const keys = Array.from(memoryCache.keys()).slice(0, 5000);
+    keys.forEach(k => memoryCache.delete(k));
   }
 
-  // Adicionar ao cache
-  eventCache.set(eventId, now);
-  console.log(`✅ Evento adicionado ao cache de deduplicação: ${eventId} (cache size: ${eventCache.size})`);
+  memoryCache.set(eventId, now);
+  console.log(`✅ [MEMORY] Evento registrado: ${eventId} (cache: ${memoryCache.size})`);
   return false;
 }
 
@@ -410,10 +434,18 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       return event;
     });
     
-    // Segundo passo: filtrar duplicatas usando os event_ids
-    const filteredData = eventsWithIds.filter((event: EventData) => {
-      return event.event_id && !isDuplicateEvent(event.event_id);
-    });
+    // Segundo passo: filtrar duplicatas usando os event_ids (async para Redis)
+    const deduplicationResults = await Promise.all(
+      eventsWithIds.map(async (event: EventData) => {
+        if (!event.event_id) return { event, isDuplicate: true };
+        const isDuplicate = await isDuplicateEvent(event.event_id);
+        return { event, isDuplicate };
+      })
+    );
+
+    const filteredData = deduplicationResults
+      .filter(({ isDuplicate }) => !isDuplicate)
+      .map(({ event }) => event);
 
     const duplicatesBlocked = originalCount - filteredData.length;
 
@@ -428,7 +460,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         message: "Todos os eventos foram filtrados como duplicatas",
         duplicates_blocked: duplicatesBlocked,
         original_count: originalCount,
-        cache_size: eventCache.size,
+        cache_type: useRedis ? "redis" : "memory",
       });
     }
 
@@ -651,8 +683,9 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         .map((e) => `${e.user_data.ct}/${e.user_data.st}/${e.user_data.zp}`)
         .slice(0, 3),
       fbc_processed: enrichedData.filter((e) => e.user_data.fbc).length,
-      cache_size: eventCache.size,
-      cache_ttl_hours: CACHE_TTL / (60 * 60 * 1000),
+      cache_size: memoryCache.size,
+      cache_ttl_hours: CACHE_TTL_SECONDS / 3600,
+      cache_type: useRedis ? "redis" : "memory",
     });
 
     const response = await fetch(`${META_URL}?access_token=${ACCESS_TOKEN}`, {
@@ -697,7 +730,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       sha256_format_count: enrichedData.filter(
         (e) => e.user_data.external_id && typeof e.user_data.external_id === 'string' && e.user_data.external_id.length === 64
       ).length,
-      cache_size: eventCache.size,
+      cache_size: memoryCache.size,
     });
 
     res.status(200).json({
@@ -707,7 +740,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         original_events: originalCount,
         processed_events: enrichedData.length,
         duplicates_blocked: duplicatesBlocked,
-        cache_size: eventCache.size,
+        cache_size: memoryCache.size,
       },
     });
   } catch (error: unknown) {
