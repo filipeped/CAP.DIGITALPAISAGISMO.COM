@@ -147,6 +147,24 @@ function hashSHA256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+// ✅ FUNÇÃO PARA GERAR VALOR DETERMINÍSTICO BASEADO NO EVENT_ID
+// Resolve problema Meta: valor varia entre eventos, mas é IGUAL entre Pixel/CAPI
+function generateDeterministicValue(eventId: string, minValue: number = 10, maxValue: number = 100): number {
+  if (!eventId || eventId.length < 8) {
+    return minValue; // Fallback seguro
+  }
+
+  // Pegar os primeiros 8 caracteres hexadecimais do eventId e converter para número
+  const hexPart = eventId.replace(/[^a-fA-F0-9]/g, '').substring(0, 8);
+  const numericValue = parseInt(hexPart, 16);
+
+  // Mapear para o range desejado (minValue até maxValue)
+  const range = maxValue - minValue + 1;
+  const deterministicValue = (numericValue % range) + minValue;
+
+  return deterministicValue;
+}
+
 // ✅ IPv6 INTELIGENTE: Detecção e validação de IP com prioridade IPv6
 function getClientIP(
   req: ApiRequest
@@ -514,8 +532,12 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         delete customData.currency;
       }
       if (eventName === "Lead") {
-        // ✅ CORREÇÃO META: Usar valor FIXO consistente com frontend (1 BRL)
-        customData.value = typeof customData.value !== "undefined" ? customData.value : 1;
+        // ✅ CORREÇÃO META: Usar valor DETERMINÍSTICO baseado no eventId
+        // Se frontend enviou valor, usar. Senão, gerar deterministicamente.
+        if (typeof customData.value === "undefined" || customData.value === null) {
+          customData.value = generateDeterministicValue(eventId, 10, 100);
+          console.log(`💰 Lead value gerado deterministicamente: ${customData.value} (eventId: ${eventId?.substring(0, 16)}...)`);
+        }
         customData.currency = customData.currency || "BRL";
       }
 
