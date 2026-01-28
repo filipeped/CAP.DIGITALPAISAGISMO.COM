@@ -1,9 +1,10 @@
-// ✅ DIGITAL PAISAGISMO CAPI V9.1 - REDIS CACHE
+// ✅ DIGITAL PAISAGISMO CAPI V9.2 - REDIS CACHE + TTL 24H
+// V9.2: TTL aumentado para 24h (recomendado Meta)
 // V9.1: Cache Redis para deduplicação distribuída
 // - Upstash Redis para cache persistente entre instâncias
 // - Fallback para Map() se Redis não configurado
 // - Suporte a PII (email, telefone, nome) para integração com n8n
-// - Deduplicação 6h, IPv6 inteligente
+// - Deduplicação 24h, IPv6 inteligente
 // - Tokens via variáveis de ambiente
 
 import * as crypto from "crypto";
@@ -68,8 +69,8 @@ if (!PIXEL_ID || !ACCESS_TOKEN) {
   console.error("❌ ERRO CRÍTICO: META_PIXEL_ID e META_ACCESS_TOKEN devem estar configurados nas variáveis de ambiente!");
 }
 
-// ✅ SISTEMA DE DEDUPLICAÇÃO COM REDIS (V9.1)
-const CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 horas em segundos
+// ✅ SISTEMA DE DEDUPLICAÇÃO COM REDIS (V9.2)
+const CACHE_TTL_SECONDS = 24 * 60 * 60; // 24 horas em segundos (recomendado Meta)
 const REDIS_KEY_PREFIX = "capi:event:";
 
 // Inicializar Redis (se configurado)
@@ -106,7 +107,7 @@ async function isDuplicateEvent(eventId: string): Promise<boolean> {
 
       // Adicionar ao Redis com TTL automático
       await redis.set(cacheKey, Date.now(), { ex: CACHE_TTL_SECONDS });
-      console.log(`✅ [REDIS] Evento registrado: ${eventId} (TTL: 6h)`);
+      console.log(`✅ [REDIS] Evento registrado: ${eventId} (TTL: 24h)`);
       return false;
 
     } catch (error) {
