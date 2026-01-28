@@ -60,8 +60,8 @@ interface ApiResponse {
 }
 
 // ✅ SEGURANÇA: Tokens via variáveis de ambiente (configurar na Vercel)
-const PIXEL_ID = process.env.META_PIXEL_ID || "";
-const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || "";
+const PIXEL_ID = (process.env.META_PIXEL_ID || "").trim();
+const ACCESS_TOKEN = (process.env.META_ACCESS_TOKEN || "").trim();
 const META_URL = `https://graph.facebook.com/v21.0/${PIXEL_ID}/events`;
 
 // ⚠️ Validação de configuração
@@ -75,12 +75,14 @@ const REDIS_KEY_PREFIX = "capi:event:";
 
 // Inicializar Redis (se configurado)
 let redis: Redis | null = null;
-const useRedis = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const redisUrl = (process.env.UPSTASH_REDIS_REST_URL || "").trim();
+const redisToken = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+const useRedis = !!(redisUrl && redisToken);
 
 if (useRedis) {
   redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL!,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+    url: redisUrl,
+    token: redisToken,
   });
   console.log("✅ Redis Upstash conectado para deduplicação distribuída");
 } else {
