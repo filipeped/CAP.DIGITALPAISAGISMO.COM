@@ -555,10 +555,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         customData.currency = customData.currency || "BRL";
       }
 
+      // CTWA (business_messaging) NÃO aceita event_source_url/client_ip/client_user_agent (Meta rejeita).
+      const ehBusinessMessaging = actionSource === "business_messaging";
       const userData: Record<string, unknown> = {
         ...(externalId && { external_id: externalId }),
-        client_ip_address: formattedIP,
-        client_user_agent: userAgent,
+        ...(ehBusinessMessaging ? {} : { client_ip_address: formattedIP, client_user_agent: userAgent }),
       };
 
       if (typeof event.user_data?.fbp === "string" && event.user_data.fbp.startsWith("fb.")) {
@@ -686,15 +687,18 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         console.log("\u{1F517} ctwa_clid repassado (plain):", (userData.ctwa_clid as string).substring(0, 24) + '...');
       }
 
-      const newReturn = {
+      const newReturn: Record<string, unknown> = {
         event_name: eventName,
         event_id: eventId,
         event_time: eventTime,
-        event_source_url: eventSourceUrl,
         action_source: actionSource,
         custom_data: customData,
         user_data: userData,
       };
+      // event_source_url só fora do fluxo CTWA (Meta proíbe em business_messaging)
+      if (!ehBusinessMessaging) {
+        newReturn.event_source_url = eventSourceUrl;
+      }
       // messaging_channel: exigido pelo Facebook quando action_source = business_messaging (CTWA)
       if (typeof event.messaging_channel === "string" && event.messaging_channel.trim()) {
         (newReturn as Record<string, unknown>).messaging_channel = event.messaging_channel.trim();
