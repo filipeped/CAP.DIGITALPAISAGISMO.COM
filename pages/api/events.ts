@@ -668,7 +668,25 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         }
       }
 
-      return {
+      // Sobrenome - normaliza para lowercase antes de hashear (igual ao fn)
+      if (typeof event.user_data?.ln === "string" && event.user_data.ln.trim()) {
+        const lastNameValue = event.user_data.ln.trim().toLowerCase();
+        if (lastNameValue.length === 64 && /^[a-f0-9]{64}$/i.test(lastNameValue)) {
+          userData.ln = lastNameValue;
+          console.log("\u{1F464} Sobrenome ja hasheado (n8n):", lastNameValue.substring(0, 16) + '...');
+        } else {
+          userData.ln = hashSHA256(lastNameValue);
+          console.log("\u{1F464} Sobrenome hasheado (API):", (userData.ln as string).substring(0, 16) + '...');
+        }
+      }
+
+      // ctwa_clid - atribuicao Click-to-WhatsApp. Vai PLAIN (NAO hashear).
+      if (typeof event.user_data?.ctwa_clid === "string" && event.user_data.ctwa_clid.trim()) {
+        userData.ctwa_clid = event.user_data.ctwa_clid.trim();
+        console.log("\u{1F517} ctwa_clid repassado (plain):", (userData.ctwa_clid as string).substring(0, 24) + '...');
+      }
+
+      const newReturn = {
         event_name: eventName,
         event_id: eventId,
         event_time: eventTime,
@@ -677,6 +695,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         custom_data: customData,
         user_data: userData,
       };
+      // messaging_channel: exigido pelo Facebook quando action_source = business_messaging (CTWA)
+      if (typeof event.messaging_channel === "string" && event.messaging_channel.trim()) {
+        (newReturn as Record<string, unknown>).messaging_channel = event.messaging_channel.trim();
+      }
+      return newReturn;
     });
 
     const payload = { data: enrichedData };
