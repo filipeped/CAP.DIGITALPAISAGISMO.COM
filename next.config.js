@@ -1,23 +1,5 @@
 module.exports = {
-  async headers() {
-    return [
-      {
-        source: "/api/(.*)",
-        headers: [
-          {
-            key: "Access-Control-Allow-Origin",
-            value: "https://www.digitalpaisagismo.com"
-          },
-          {
-            key: "Access-Control-Allow-Methods",
-            value: "GET,POST,OPTIONS"
-          },
-          {
-            key: "Access-Control-Allow-Headers",
-            value: "Content-Type"
-          }
-        ]
-      }
-    ];
-  }
+  // CORS é tratado dinamicamente em pages/api/events.ts (ALLOWED_ORIGINS),
+  // por isso NÃO definimos Access-Control-* aqui — header global fixo
+  // conflitava com a lista dinâmica e bloqueava origens válidas.
 };

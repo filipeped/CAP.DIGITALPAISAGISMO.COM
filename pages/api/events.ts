@@ -413,6 +413,8 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     "https://cap.consultoria.digitalpaisagismo.com",
     "https://n8n.digitalpaisagismo.online",
     "https://n8n.jarviz.site",
+    "https://gestao.digitalpaisagismo.com",
+    "https://www.gestao.digitalpaisagismo.com",
     // ✅ SEGURANÇA: localhost removido em produção
     // Para dev local, adicione temporariamente ou use variável de ambiente
   ];
