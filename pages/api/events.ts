@@ -687,23 +687,22 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         console.log("\u{1F517} ctwa_clid repassado (plain):", (userData.ctwa_clid as string).substring(0, 24) + '...');
       }
 
-      const newReturn: Record<string, unknown> = {
+      // event_source_url só fora do fluxo CTWA (Meta proíbe em business_messaging).
+      // messaging_channel só dentro do fluxo CTWA. Spread condicional preserva os tipos.
+      const temMessagingChannel =
+        typeof event.messaging_channel === "string" && event.messaging_channel.trim().length > 0;
+      return {
         event_name: eventName,
         event_id: eventId,
         event_time: eventTime,
         action_source: actionSource,
         custom_data: customData,
         user_data: userData,
+        ...(ehBusinessMessaging ? {} : { event_source_url: eventSourceUrl }),
+        ...(temMessagingChannel
+          ? { messaging_channel: (event.messaging_channel as string).trim() }
+          : {}),
       };
-      // event_source_url só fora do fluxo CTWA (Meta proíbe em business_messaging)
-      if (!ehBusinessMessaging) {
-        newReturn.event_source_url = eventSourceUrl;
-      }
-      // messaging_channel: exigido pelo Facebook quando action_source = business_messaging (CTWA)
-      if (typeof event.messaging_channel === "string" && event.messaging_channel.trim()) {
-        (newReturn as Record<string, unknown>).messaging_channel = event.messaging_channel.trim();
-      }
-      return newReturn;
     });
 
     const payload = { data: enrichedData };
