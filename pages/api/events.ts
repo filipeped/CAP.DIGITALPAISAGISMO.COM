@@ -768,9 +768,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       };
     });
 
-    // ✅ V9.3: access_token vai no CORPO (não na query string da URL) — evita vazar o
-    // token em logs de proxy/CDN que capturam a URL. A CAPI /events aceita no body.
-    const payload = { data: enrichedData, access_token: ACCESS_TOKEN };
+    const payload = { data: enrichedData };
     const jsonPayload = JSON.stringify(payload);
     const shouldCompress = Buffer.byteLength(jsonPayload) > 2048;
     const body = shouldCompress ? zlib.gzipSync(jsonPayload) : jsonPayload;
@@ -817,7 +815,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       cache_type: useRedis ? "redis" : "memory",
     });
 
-    const response = await fetch(META_URL, {
+    const response = await fetch(`${META_URL}?access_token=${ACCESS_TOKEN}`, {
       method: "POST",
       headers,
       body: body as BodyInit,
