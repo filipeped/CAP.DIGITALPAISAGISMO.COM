@@ -64,6 +64,12 @@ const PIXEL_ID = (process.env.META_PIXEL_ID || "").trim();
 const ACCESS_TOKEN = (process.env.META_ACCESS_TOKEN || "").trim();
 const META_URL = `https://graph.facebook.com/v21.0/${PIXEL_ID}/events`;
 
+// ✅ V9.3: Segredo compartilhado pra provar origem server-to-server (header x-internal-secret).
+// Callers: .03 (api/_lib/meta-capi.js) e n8n. Fail-open: se a env NÃO estiver setada, o
+// proxy aceita (não derruba produção) e loga aviso. Só ative depois que TODOS os callers
+// (.03 e n8n) estiverem mandando o header — senão os eventos deles tomam 401. Ver AUDITORIA-CAPI.md.
+const INTERNAL_SECRET = (process.env.INTERNAL_SECRET || "").trim();
+
 // ⚠️ Validação de configuração
 if (!PIXEL_ID || !ACCESS_TOKEN) {
   console.error("❌ ERRO CRÍTICO: META_PIXEL_ID e META_ACCESS_TOKEN devem estar configurados nas variáveis de ambiente!");
@@ -93,23 +99,30 @@ if (useRedis) {
 const memoryCache = new Map<string, number>();
 const MAX_MEMORY_CACHE = 50000;
 
+// ✅ V9.3: Dedup em 2 fases (lock in-flight → confirma na entrega).
+// Antes o event_id era gravado ANTES do POST pra Meta; se a Meta falhasse, o retry do
+// caller era barrado como "duplicado" e o evento se PERDIA. Agora:
+//  1. isDuplicateEvent() só ADQUIRE um lock curto (90s) via SET NX.
+//  2. confirmDelivery() estende o TTL pra 24h SÓ após a Meta responder 2xx (dedup real).
+//  3. releaseEvents() APAGA o lock se a Meta falhar → o retry passa a valer.
+// Corridas de 2 requests idênticos: o 2º pega o lock existente e é tratado como dup —
+// a própria Meta ainda deduplica nativamente por event_id, então nunca conta 2x.
+const IN_FLIGHT_TTL_SECONDS = 90; // lock curto enquanto o evento está "em voo" pra Meta
+
 async function isDuplicateEvent(eventId: string): Promise<boolean> {
   const cacheKey = `${REDIS_KEY_PREFIX}${eventId}`;
 
   // ✅ REDIS: Cache distribuído persistente
   if (redis) {
     try {
-      // Verificar se existe no Redis
-      const exists = await redis.exists(cacheKey);
-
-      if (exists) {
-        console.warn(`🚫 [REDIS] Evento duplicado bloqueado: ${eventId}`);
+      // SET NX: só grava se ainda não existir. Lock in-flight de 90s (não 24h).
+      // Retorna "OK" se adquiriu; null/undefined se já existia (em voo ou já entregue).
+      const acquired = await redis.set(cacheKey, Date.now(), { nx: true, ex: IN_FLIGHT_TTL_SECONDS });
+      if (acquired === null || acquired === undefined) {
+        console.warn(`🚫 [REDIS] Evento duplicado/em-voo bloqueado: ${eventId}`);
         return true;
       }
-
-      // Adicionar ao Redis com TTL automático
-      await redis.set(cacheKey, Date.now(), { ex: CACHE_TTL_SECONDS });
-      console.log(`✅ [REDIS] Evento registrado: ${eventId} (TTL: 24h)`);
+      console.log(`🔒 [REDIS] Lock in-flight adquirido (90s): ${eventId}`);
       return false;
 
     } catch (error) {
@@ -140,8 +153,38 @@ async function isDuplicateEvent(eventId: string): Promise<boolean> {
   }
 
   memoryCache.set(eventId, now);
-  console.log(`✅ [MEMORY] Evento registrado: ${eventId} (cache: ${memoryCache.size})`);
+  console.log(`✅ [MEMORY] Evento registrado (in-flight): ${eventId} (cache: ${memoryCache.size})`);
   return false;
+}
+
+// ✅ V9.3: Confirma a entrega — estende o lock pra 24h (dedup recomendado pela Meta).
+// Chamado SÓ quando a Meta responde 2xx.
+async function confirmDelivery(eventIds: string[]): Promise<void> {
+  if (redis) {
+    try {
+      await Promise.all(
+        eventIds.map((id) => redis!.set(`${REDIS_KEY_PREFIX}${id}`, Date.now(), { ex: CACHE_TTL_SECONDS }))
+      );
+      console.log(`✅ [REDIS] Entrega confirmada, dedup 24h: ${eventIds.length} evento(s)`);
+    } catch (error) {
+      console.error("❌ Erro Redis ao confirmar entrega (lock in-flight expira em 90s):", error);
+    }
+  }
+  // Memória: o timestamp já está gravado com TTL de 24h — nada a fazer.
+}
+
+// ✅ V9.3: Libera os locks após FALHA na Meta, pra o retry do caller NÃO ser barrado.
+async function releaseEvents(eventIds: string[]): Promise<void> {
+  if (!eventIds.length) return;
+  if (redis) {
+    try {
+      await Promise.all(eventIds.map((id) => redis!.del(`${REDIS_KEY_PREFIX}${id}`)));
+      console.warn(`♻️ [REDIS] Locks liberados após falha (retry liberado): ${eventIds.length} evento(s)`);
+    } catch (error) {
+      console.error("❌ Erro Redis ao liberar locks (expiram sozinhos em 90s):", error);
+    }
+  }
+  eventIds.forEach((id) => memoryCache.delete(id));
 }
 
 // ✅ REINTRODUZIDO: A função hashSHA256 é necessária como fallback para gerar event_id no servidor.
@@ -149,23 +192,8 @@ function hashSHA256(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
-// ✅ FUNÇÃO PARA GERAR VALOR DETERMINÍSTICO BASEADO NO EVENT_ID
-// Resolve problema Meta: valor varia entre eventos, mas é IGUAL entre Pixel/CAPI
-function generateDeterministicValue(eventId: string, minValue: number = 10, maxValue: number = 100): number {
-  if (!eventId || eventId.length < 8) {
-    return minValue; // Fallback seguro
-  }
-
-  // Pegar os primeiros 8 caracteres hexadecimais do eventId e converter para número
-  const hexPart = eventId.replace(/[^a-fA-F0-9]/g, '').substring(0, 8);
-  const numericValue = parseInt(hexPart, 16);
-
-  // Mapear para o range desejado (minValue até maxValue)
-  const range = maxValue - minValue + 1;
-  const deterministicValue = (numericValue % range) + minValue;
-
-  return deterministicValue;
-}
+// ✅ V9.3: generateDeterministicValue REMOVIDA — o proxy não inventa mais valor de Lead
+// (sujava a otimização por valor da Meta). Lead sem value agora vai sem value.
 
 // ✅ IPv6 INTELIGENTE: Detecção e validação de IP com prioridade IPv6
 function getClientIP(
@@ -436,6 +464,22 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
   if (!rateLimit(ip)) return res.status(429).json({ error: "Limite de requisições excedido", retry_after: 60 });
 
+  // ✅ V9.3: Auth server-to-server fail-open. Sem INTERNAL_SECRET setado → aceita e avisa
+  // (não derruba produção). Com a env setada → exige o header x-internal-secret batendo.
+  if (INTERNAL_SECRET) {
+    const got = String(req.headers["x-internal-secret"] || "").trim();
+    if (got !== INTERNAL_SECRET) {
+      console.warn("🚫 [AUTH] x-internal-secret inválido/ausente — evento recusado");
+      return res.status(401).json({ error: "nao autorizado" });
+    }
+  } else {
+    console.warn("⚠️ [AUTH] INTERNAL_SECRET não configurado — proxy fail-open (configure nos dois lados p/ ativar)");
+  }
+
+  // ✅ V9.3: event_ids cujo lock in-flight adquirimos nesta request. Se a Meta falhar
+  // (erro ou exceção), liberamos esses locks pra o retry do caller não ser barrado.
+  let acquiredEventIds: string[] = [];
+
   try {
     // ==================== PROCESSAMENTO FRONTEND ====================
     if (!req.body?.data || !Array.isArray(req.body.data)) {
@@ -473,6 +517,11 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     const filteredData = deduplicationResults
       .filter(({ isDuplicate }) => !isDuplicate)
       .map(({ event }) => event);
+
+    // Locks in-flight que adquirimos agora → liberar se a Meta falhar.
+    acquiredEventIds = filteredData
+      .map((e) => e.event_id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
 
     const duplicatesBlocked = originalCount - filteredData.length;
 
@@ -546,13 +595,15 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         delete customData.currency;
       }
       if (eventName === "Lead") {
-        // ✅ CORREÇÃO META: Usar valor DETERMINÍSTICO baseado no eventId
-        // Se frontend enviou valor, usar. Senão, gerar deterministicamente.
+        // ✅ V9.3: NÃO inventar valor. Antes o proxy gerava um valor fictício (R$10-100)
+        // em Lead sem value, sujando a otimização por valor da Meta com dinheiro que não
+        // existe. Agora: se o caller mandou value, mantém (e garante currency); se não
+        // mandou, o Lead vai SEM value — mais honesto pra Meta. Ver AUDITORIA-CAPI.md.
         if (typeof customData.value === "undefined" || customData.value === null) {
-          customData.value = generateDeterministicValue(eventId, 10, 100);
-          console.log(`💰 Lead value gerado deterministicamente: ${customData.value} (eventId: ${eventId?.substring(0, 16)}...)`);
+          console.log(`ℹ️ Lead sem value — enviado sem valor (não inventamos mais). eventId: ${eventId?.substring(0, 16)}...`);
+        } else {
+          customData.currency = customData.currency || "BRL";
         }
-        customData.currency = customData.currency || "BRL";
       }
 
       // CTWA (business_messaging) NÃO aceita event_source_url/client_ip/client_user_agent (Meta rejeita).
@@ -645,15 +696,27 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         }
       }
 
-      // Telefone - remove caracteres não numéricos antes de hashear
+      // Telefone
       if (typeof event.user_data?.ph === "string" && event.user_data.ph.trim()) {
-        const phoneValue = event.user_data.ph.trim().replace(/\D/g, '');
-        if (phoneValue.length === 64 && /^[a-f0-9]{64}$/i.test(phoneValue)) {
-          userData.ph = phoneValue;
-          console.log("📱 Telefone já hasheado (n8n):", phoneValue.substring(0, 16) + '...');
-        } else if (phoneValue.length > 0) {
-          userData.ph = hashSHA256(phoneValue);
-          console.log("📱 Telefone hasheado (API):", (userData.ph as string).substring(0, 16) + '...');
+        const phoneRaw = event.user_data.ph.trim();
+        // ✅ V9.3: testar "já hasheado" ANTES de remover não-dígitos. O SHA256 tem letras
+        // a-f que o replace(/\D/) apagaria → antes isso causava DOUBLE-HASH de lixo.
+        if (phoneRaw.length === 64 && /^[a-f0-9]{64}$/i.test(phoneRaw)) {
+          userData.ph = phoneRaw.toLowerCase();
+          console.log("📱 Telefone já hasheado (n8n):", (userData.ph as string).substring(0, 16) + '...');
+        } else {
+          let phoneDigits = phoneRaw.replace(/\D/g, '');
+          // ✅ V9.3: rede de segurança do DDI Brasil (55). A Meta exige o código do país.
+          // Nº nacional (DDD+numero) tem 10-11 dígitos; sem DDI o hash não bate. Prefixa 55.
+          // (Com DDI já são 12-13 dígitos — não mexe.)
+          if (phoneDigits.length === 10 || phoneDigits.length === 11) {
+            phoneDigits = '55' + phoneDigits;
+            console.log("📱 DDI 55 adicionado (telefone nacional sem código do país)");
+          }
+          if (phoneDigits.length > 0) {
+            userData.ph = hashSHA256(phoneDigits);
+            console.log("📱 Telefone hasheado (API):", (userData.ph as string).substring(0, 16) + '...');
+          }
         }
       }
 
@@ -705,7 +768,9 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       };
     });
 
-    const payload = { data: enrichedData };
+    // ✅ V9.3: access_token vai no CORPO (não na query string da URL) — evita vazar o
+    // token em logs de proxy/CDN que capturam a URL. A CAPI /events aceita no body.
+    const payload = { data: enrichedData, access_token: ACCESS_TOKEN };
     const jsonPayload = JSON.stringify(payload);
     const shouldCompress = Buffer.byteLength(jsonPayload) > 2048;
     const body = shouldCompress ? zlib.gzipSync(jsonPayload) : jsonPayload;
@@ -752,7 +817,7 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
       cache_type: useRedis ? "redis" : "memory",
     });
 
-    const response = await fetch(`${META_URL}?access_token=${ACCESS_TOKEN}`, {
+    const response = await fetch(META_URL, {
       method: "POST",
       headers,
       body: body as BodyInit,
@@ -772,12 +837,19 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
         duplicates_blocked: duplicatesBlocked,
       });
 
+      // ✅ V9.3: Meta recusou → LIBERA os locks pra o retry do caller não ser barrado
+      // como "duplicado" (senão o evento se perderia silenciosamente).
+      await releaseEvents(acquiredEventIds);
+
       return res.status(response.status).json({
         error: "Erro da Meta",
         details: data,
         processing_time_ms: responseTime,
       });
     }
+
+    // ✅ V9.3: Meta aceitou (2xx) → confirma a entrega, estendendo o dedup pra 24h.
+    await confirmDelivery(acquiredEventIds);
 
     console.log("✅ Evento enviado com sucesso para Meta CAPI (V8.8):", {
       events_processed: enrichedData.length,
@@ -809,6 +881,9 @@ export default async function handler(req: ApiRequest, res: ApiResponse) {
     });
   } catch (error: unknown) {
     console.error("❌ Erro no Proxy CAPI:", error);
+    // ✅ V9.3: Timeout/erro de rede antes/depois do POST → libera os locks in-flight
+    // pra o retry do caller poder reenviar (não fica preso como "duplicado").
+    await releaseEvents(acquiredEventIds);
     if (error instanceof Error && error.name === "AbortError") {
       return res
         .status(408)
